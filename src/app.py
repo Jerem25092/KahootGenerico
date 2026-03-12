@@ -1,15 +1,17 @@
 """
 TeamKahoot — Backend (Railway)
-Flask + Flask-SocketIO + PostgreSQL
+Flask + Flask-SocketIO + MySQL (PyMySQL)
 """
 
-import os, random, time
+import os, random, time, json
 from flask import Flask, request, jsonify
 from flask_socketio import SocketIO, emit, join_room
 from flask_cors import CORS
-import psycopg2, psycopg2.extras
+import pymysql
+import pymysql.cursors
 import bcrypt
 from dotenv import load_dotenv
+from urllib.parse import urlparse
 
 load_dotenv()
 
@@ -17,10 +19,8 @@ load_dotenv()
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'kahoot-secret-2024')
 
-# Allow requests from Vercel frontend (and localhost for dev)
 FRONTEND_URL = os.getenv('FRONTEND_URL', '*')
 CORS(app, origins=[FRONTEND_URL, 'http://localhost:3000', 'http://127.0.0.1:3000'])
-
 socketio = SocketIO(
     app,
     cors_allowed_origins=[FRONTEND_URL, 'http://localhost:3000', 'http://127.0.0.1:3000', '*'],
@@ -30,25 +30,58 @@ socketio = SocketIO(
 )
 
 # ── Database ──────────────────────────────────────────────────
+def parse_db_url(url):
+    """Parse DATABASE_URL into PyMySQL connect kwargs."""
+    p = urlparse(url)
+    return {
+        'host':    p.hostname,
+        'port':    p.port or 3306,
+        'user':    p.username,
+        'password': p.password,
+        'database': p.path.lstrip('/'),
+        'charset': 'utf8mb4',
+        'cursorclass': pymysql.cursors.DictCursor,
+    }
+
 def get_db():
     url = os.getenv('DATABASE_URL', '')
-    return psycopg2.connect(url, sslmode='require')
+    kwargs = parse_db_url(url)
+    return pymysql.connect(**kwargs)
 
 def query(sql, params=(), fetchone=False, fetchall=False, commit=False):
     conn = get_db()
-    cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute(sql, params)
     result = None
-    if fetchone:
-        row = cur.fetchone()
-        result = dict(row) if row else None
-    if fetchall:
-        result = [dict(r) for r in cur.fetchall()]
-    if commit:
-        conn.commit()
-    cur.close()
-    conn.close()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            if fetchone:
+                row = cur.fetchone()
+                result = dict(row) if row else None
+            if fetchall:
+                result = [dict(r) for r in cur.fetchall()]
+            if commit:
+                conn.commit()
+                # For INSERT — return lastrowid as {'id': ...}
+                if result is None and cur.lastrowid:
+                    result = {'id': cur.lastrowid}
+    finally:
+        conn.close()
     return result
+
+def query_returning(sql, params, returning_sql, returning_params):
+    """Execute INSERT then fetch the inserted row (MySQL has no RETURNING)."""
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            conn.commit()
+            last_id = cur.lastrowid
+        with conn.cursor() as cur:
+            cur.execute(returning_sql, (last_id,) if returning_params == 'lastrowid' else returning_params)
+            row = cur.fetchone()
+            return dict(row) if row else None
+    finally:
+        conn.close()
 
 # ── In-memory game rooms ──────────────────────────────────────
 rooms: dict = {}
@@ -63,10 +96,17 @@ def make_code():
             return code
 
 def get_questions(topic_id):
-    return query(
-        'SELECT * FROM questions WHERE topic_id=%s ORDER BY RANDOM() LIMIT 10',
+    rows = query(
+        'SELECT * FROM questions WHERE topic_id=%s ORDER BY RAND() LIMIT 10',
         (topic_id,), fetchall=True
     ) or []
+    for r in rows:
+        if isinstance(r.get('answer_options'), str):
+            r['answer_options'] = json.loads(r['answer_options'])
+        # MySQL returns TINYINT for booleans — normalize
+        if 'is_correct' in r:
+            r['is_correct'] = bool(r['is_correct'])
+    return rows
 
 def room_pub(room):
     players = list(room['players'].values())
@@ -102,19 +142,23 @@ def register():
     if len(username) < 3:
         return jsonify(error='El nombre debe tener al menos 3 caracteres'), 400
     if len(password) < 6:
-        return jsonify(error='La contraseña debe tener al menos 6 caracteres'), 400
+        return jsonify(error='La contrasena debe tener al menos 6 caracteres'), 400
     try:
-        exists = query('SELECT id FROM users WHERE email=%s OR username=%s',
-                       (email, username), fetchone=True)
+        exists = query(
+            'SELECT id FROM users WHERE email=%s OR username=%s',
+            (email, username), fetchone=True
+        )
         if exists:
             return jsonify(error='Email o nombre de usuario ya en uso'), 409
+
         pw_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
         avatar  = random.randint(1, 8)
-        user = query(
-            '''INSERT INTO users (username, email, password_hash, avatar)
-               VALUES (%s,%s,%s,%s)
-               RETURNING id, username, email, avatar, games_played, total_score''',
-            (username, email, pw_hash, avatar), fetchone=True, commit=True
+
+        user = query_returning(
+            'INSERT INTO users (username, email, password_hash, avatar) VALUES (%s,%s,%s,%s)',
+            (username, email, pw_hash, avatar),
+            'SELECT id, username, email, avatar, games_played, total_score FROM users WHERE id=%s',
+            'lastrowid'
         )
         return jsonify(success=True, user=user), 201
     except Exception as e:
@@ -126,13 +170,13 @@ def login():
     email    = (d.get('email')    or '').strip().lower()
     password = d.get('password')  or ''
     if not email or not password:
-        return jsonify(error='Email y contraseña requeridos'), 400
+        return jsonify(error='Email y contrasena requeridos'), 400
     try:
         user = query('SELECT * FROM users WHERE email=%s', (email,), fetchone=True)
         if not user:
             return jsonify(error='Usuario no encontrado'), 401
         if not bcrypt.checkpw(password.encode(), user['password_hash'].encode()):
-            return jsonify(error='Contraseña incorrecta'), 401
+            return jsonify(error='Contrasena incorrecta'), 401
         query('UPDATE users SET last_seen=NOW() WHERE id=%s', (user['id'],), commit=True)
         return jsonify(success=True, user={
             'id': user['id'], 'username': user['username'],
@@ -168,7 +212,7 @@ def leaderboard():
 @socketio.on('create-room')
 def on_create_room(data):
     topic_id  = data.get('topicId')
-    host_name = (data.get('hostName') or 'Anfitrión').strip()
+    host_name = (data.get('hostName') or 'Anfitrion').strip()
     user_id   = data.get('userId')
 
     topic = query('SELECT * FROM topics WHERE id=%s', (topic_id,), fetchone=True)
@@ -209,15 +253,15 @@ def on_join_room(data):
     user_id  = data.get('userId')
 
     if code not in rooms:
-        emit('join-error', {'msg': 'Sala no encontrada. Verifica el código.'}); return
+        emit('join-error', {'msg': 'Sala no encontrada. Verifica el codigo.'}); return
     room = rooms[code]
     if room['state'] != 'waiting':
-        emit('join-error', {'msg': 'El juego ya comenzó.'}); return
+        emit('join-error', {'msg': 'El juego ya comenzo.'}); return
     if not username:
         emit('join-error', {'msg': 'Necesitas un nombre.'}); return
     for p in room['players'].values():
         if p['username'].lower() == username.lower():
-            emit('join-error', {'msg': 'Ese nombre ya está en uso en esta sala.'}); return
+            emit('join-error', {'msg': 'Ese nombre ya esta en uso en esta sala.'}); return
 
     team   = next_team(room)
     player = {
@@ -342,7 +386,7 @@ def send_question(code):
     room.update({'current_q': q, 'state': 'question', 'q_answers': {}, 'timer_cancel': False})
     socketio.emit('new-question', {
         'question':       {'id': q['id'], 'question_text': q['question_text'],
-                           'options': q['options'], 'time_limit': q['time_limit']},
+                           'options': q['answer_options'], 'time_limit': q['time_limit']},
         'questionNumber': room['current_idx'] + 1,
         'totalQuestions': len(room['questions']),
         'teamScores':     room['team_scores'],
@@ -363,6 +407,7 @@ def send_question(code):
 
     socketio.start_background_task(run_timer)
 
+
 def do_show_results(code):
     room = rooms.get(code)
     if not room or room['state'] in ('results', 'gameover'): return
@@ -379,7 +424,7 @@ def do_show_results(code):
 
     socketio.emit('question-results', {
         'correctAnswer':     q['correct_answer'],
-        'correctAnswerText': q['options'][q['correct_answer']],
+        'correctAnswerText': q['answer_options'][q['correct_answer']],
         'playerResults': results,
         'teamA': [r for r in results if r['team'] == 'A'],
         'teamB': [r for r in results if r['team'] == 'B'],
@@ -389,6 +434,7 @@ def do_show_results(code):
         'totalQuestions': len(room['questions']),
     }, to=code)
 
+
 def end_game(code):
     room = rooms.get(code)
     if not room: return
@@ -397,39 +443,51 @@ def end_game(code):
     s = room['team_scores']
     winner = 'A' if s['A'] > s['B'] else ('B' if s['B'] > s['A'] else 'DRAW')
     players = sorted(room['players'].values(), key=lambda p: -p['score'])
+
     try:
         wc = 1 if winner == 'A' else (2 if winner == 'B' else 0)
         host_uid = next((p['userId'] for p in players if p['isHost']), None)
-        sess = query(
-            '''INSERT INTO game_sessions
-               (room_code,topic_id,host_user_id,host_name,total_questions,
-                team_a_score,team_b_score,winner_team,player_count,ended_at)
-               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW()) RETURNING id''',
-            (code, room['topic']['id'], host_uid, room['host_name'],
-             len(room['questions']), s['A'], s['B'], wc, len(players)),
-            fetchone=True, commit=True
-        )
-        for p in players:
-            query(
-                '''INSERT INTO session_players
-                   (session_id,user_id,guest_name,team,final_score,is_host)
-                   VALUES (%s,%s,%s,%s,%s,%s)''',
-                (sess['id'], p['userId'],
-                 None if p['userId'] else p['username'],
-                 1 if p['team']=='A' else 2, p['score'], p['isHost']),
-                commit=True
-            )
-            if p['userId']:
-                won = 1 if p['team'] == winner else 0
-                query('UPDATE users SET games_played=games_played+1,games_won=games_won+%s,total_score=total_score+%s WHERE id=%s',
-                      (won, p['score'], p['userId']), commit=True)
+
+        conn = get_db()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    '''INSERT INTO game_sessions
+                       (room_code, topic_id, host_user_id, host_name,
+                        total_questions, team_a_score, team_b_score,
+                        winner_team, player_count, ended_at)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())''',
+                    (code, room['topic']['id'], host_uid, room['host_name'],
+                     len(room['questions']), s['A'], s['B'], wc, len(players))
+                )
+                sess_id = cur.lastrowid
+
+                for p in players:
+                    team_num = 1 if p['team'] == 'A' else 2
+                    cur.execute(
+                        '''INSERT INTO session_players
+                           (session_id, user_id, guest_name, team, final_score, is_host)
+                           VALUES (%s,%s,%s,%s,%s,%s)''',
+                        (sess_id, p['userId'],
+                         None if p['userId'] else p['username'],
+                         team_num, p['score'], 1 if p['isHost'] else 0)
+                    )
+                    if p['userId']:
+                        won = 1 if p['team'] == winner else 0
+                        cur.execute(
+                            'UPDATE users SET games_played=games_played+1, games_won=games_won+%s, total_score=total_score+%s WHERE id=%s',
+                            (won, p['score'], p['userId'])
+                        )
+                conn.commit()
+        finally:
+            conn.close()
     except Exception as e:
         print(f'[DB] end_game error: {e}')
 
     socketio.emit('game-over', {
         'winner': winner, 'teamScores': s,
-        'playerResults': [{'username':p['username'],'team':p['team'],
-                           'avatar':p['avatar'],'score':p['score'],'isHost':p['isHost']}
+        'playerResults': [{'username': p['username'], 'team': p['team'],
+                           'avatar': p['avatar'], 'score': p['score'], 'isHost': p['isHost']}
                           for p in players],
     }, to=code)
 
@@ -438,8 +496,9 @@ def end_game(code):
         rooms.pop(c, None)
     socketio.start_background_task(_clean)
 
+
 # ═════════════════════════════════════════════════════════════
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 3000))
-    print(f'🚀 Backend corriendo en http://0.0.0.0:{port}')
+    print(f'Servidor corriendo en http://0.0.0.0:{port}')
     socketio.run(app, host='0.0.0.0', port=port, debug=False)
